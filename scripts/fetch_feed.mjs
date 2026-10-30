@@ -193,7 +193,7 @@ async function main() {
   if (manifest.sports.length < MIN_SPORTS) {
     // Exit non-zero so the workflow fails and Pages keeps the previous deploy.
     // A stale-but-complete board beats an empty one.
-    console.error(`only ${manifest.sports.length} sport(s) qualified; refusing to publish`);
+    console.error(`refusing to publish -- only ${manifest.sports.length} sport(s) qualified`);
     process.exit(1);
   }
 

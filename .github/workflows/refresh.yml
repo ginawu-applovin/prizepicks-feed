@@ -1,15 +1,30 @@
 name: refresh feed
 
-# Deploys straight to Pages from an artifact rather than committing the JSON.
-# At a 5-minute cadence a commit-per-refresh would be ~288 commits a day and
-# would bury every real change in the history.
+# WHY THIS IS A LOOP AND NOT A CRON
+#
+# Same finding as public-15min-feed, re-confirmed on this repo: GitHub's
+# scheduler did not deliver a single `*/5` run in 36 minutes of watching, with
+# the workflow active, the cron valid, on the default branch of a public repo.
+# High-frequency schedules are deprioritised hard and the docs only promise
+# "may be delayed".
+#
+# Having each run dispatch its successor is not available: GitHub refuses to
+# start a workflow from an action authenticated with GITHUB_TOKEN, to prevent
+# recursion. The alternative is a personal access token sitting in a public
+# repo's secrets, which is a standing write credential and not worth it here.
+#
+# So one run refreshes on its own clock for ~5.5 hours. The schedule below is
+# no longer the cadence; it is only a seed. With `cancel-in-progress: false`,
+# a tick that lands while a run is active becomes the queued successor and
+# starts when the current one ends.
+#
+# Kill switch: set the repo variable LOOP to `off` and each run does a single
+# pass and exits.
+
 on:
   schedule:
-    # Every 5 minutes is the floor GitHub allows, and it is a best-effort floor:
-    # scheduled runs are routinely late under load. The feed is built to tolerate
-    # that -- see the staleness note in README.
-    - cron: '*/5 * * * *'
-  workflow_dispatch:        # "Run workflow" in the Actions tab, for a manual refresh
+    - cron: '*/5 * * * *'     # a seed, not the cadence -- see above
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -18,22 +33,16 @@ on:
       - '.github/workflows/refresh.yml'
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write             # pushes the built feed to the `feed` branch
 
-# Let a running deploy finish; queue at most one behind it. Without this a slow
-# run and the next cron tick race each other onto Pages.
 concurrency:
-  group: pages
+  group: feed-refresh
   cancel-in-progress: false
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -41,35 +50,105 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Build the feed
-        run: node scripts/fetch_feed.mjs --out docs
-
-      - name: Check what was built
+      - name: Refresh loop
+        env:
+          LOOP: ${{ vars.LOOP }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          node -e '
-            const fs = require("fs");
-            const m = JSON.parse(fs.readFileSync("docs/manifest.json", "utf8"));
-            if (!m.sports.length) { console.error("empty manifest"); process.exit(1); }
-            for (const s of m.sports) {
-              const f = JSON.parse(fs.readFileSync("docs/" + s.file, "utf8"));
-              const games = new Set(f.picks.map(p => p.game_id)).size;
-              // A board whose games have all started is worse than no board:
-              // the ad would offer lines on a game in progress.
-              const live = f.picks.filter(p => Date.parse(p.start) <= Date.now()).length;
-              console.log(`${s.league}: ${games} matchups, ${f.picks.length} picks` +
-                          (live ? `, ${live} already started` : ""));
-              if (live === f.picks.length) {
-                console.error(`::error::${s.league} has no upcoming games`);
-                process.exit(1);
-              }
-            }
-            console.log(`expires ${m.expires_at}`);
-          '
+          set -u
+          INTERVAL=300
+          DEADLINE=$(( $(date +%s) + 330*60 ))
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs
+          git config user.name  "feed bot"
+          git config user.email "noreply@github.com"
 
-      - id: deploy
-        uses: actions/deploy-pages@v4
+          # Built with plumbing rather than by switching branches: `git switch
+          # --orphan` removes every tracked file from the working tree, so the
+          # next iteration could not find scripts/fetch_feed.mjs. read-tree
+          # --empty + add + write-tree + commit-tree makes a parentless commit
+          # holding only docs/, so `feed` stays at a single commit instead of
+          # growing one per pass.
+          publish() {
+            local msg="$1"
+            # Never publish a tree without a manifest. docs/*.json is gitignored
+            # and absent from a fresh checkout, so republishing blindly on a
+            # refused build would wipe the live endpoint.
+            if [ ! -f docs/manifest.json ]; then
+              echo "::warning::no docs/manifest.json -- refusing to publish an empty tree"
+              return 1
+            fi
+            export GIT_INDEX_FILE="$RUNNER_TEMP/feed.index"
+            rm -f "$GIT_INDEX_FILE"
+            git read-tree --empty
+            git add -f docs
+            local tree commit
+            tree=$(git write-tree)
+            commit=$(git commit-tree "$tree" -m "$msg")
+            unset GIT_INDEX_FILE
+            git push -q -f origin "$commit:refs/heads/feed"
+          }
+
+          # Written every pass and published even when a build is refused, so a
+          # refusal shows on the live site rather than only in a log that does
+          # not flush until this step ends hours from now.
+          status() {
+            printf '{"last_attempt":"%s","outcome":"%s","reason":"%s","published":%s,"refused":%s,"run":"%s"}\n' \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$PUBLISHED" "$REFUSED" "$RUN_URL" \
+              > docs/status.json
+          }
+
+          # Seed docs/ from whatever is already published, so a refused build
+          # has a real feed to republish alongside the fresh status.
+          if git fetch -q --depth 1 origin feed 2>/dev/null; then
+            git checkout -q origin/feed -- docs 2>/dev/null \
+              && echo "seeded docs/ from the feed branch" \
+              || echo "feed branch has no docs/ yet"
+          else
+            echo "no feed branch yet -- first publish will create it"
+          fi
+
+          PUBLISHED=0
+          REFUSED=0
+
+          while :; do
+            if OUT=$(node scripts/fetch_feed.mjs --out docs 2>&1); then
+              PUBLISHED=$((PUBLISHED+1))
+              status ok ""
+              publish "feed @ $(date -u +%Y-%m-%dT%H:%MZ)"
+              echo "$(date -u +%H:%M:%SZ) published #$PUBLISHED"
+              printf '%s\n' "$OUT" | sed 's/^/    /'
+            else
+              # Expected occasionally: between slates every matchup can fall
+              # outside the window at once. docs/ still holds the last good
+              # feed, so this republishes it with a fresh status.json.
+              REFUSED=$((REFUSED+1))
+              REASON=$(printf '%s' "$OUT" | sed -n 's/^refusing to publish -- //p' | head -1 | tr -d '"')
+              status refused "${REASON:-unknown}"
+              publish "status @ $(date -u +%Y-%m-%dT%H:%MZ)"
+              echo "$(date -u +%H:%M:%SZ) refused #$REFUSED: ${REASON:-unknown}"
+            fi
+
+            if [ "${LOOP:-}" = "off" ]; then echo "LOOP=off, exiting"; break; fi
+            NOW=$(date +%s)
+            REMAIN=$(( DEADLINE - NOW ))
+            [ "$REMAIN" -lt "$INTERVAL" ] && { echo "deadline reached"; break; }
+            sleep "$INTERVAL"
+          done
+
+          echo "published $PUBLISHED - refused $REFUSED"
+
+      - name: Smoke test before the job ends
+        if: always()
+        run: |
+          # Proves the published branch is loadable and self-consistent. Runs
+          # even on cancel, so a broken publish is caught here rather than by
+          # someone opening the ad.
+          set -e
+          U=https://ginawu-applovin.github.io/prizepicks-feed
+          curl -sf --max-time 20 "$U/status.json" | tee /dev/stderr | \
+            node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8"));
+                     if(!s.last_attempt) { console.error("no last_attempt"); process.exit(1); }'
+          curl -sf --max-time 20 "$U/manifest.json" | \
+            node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));
+                     if(!m.sports || !m.sports.length) { console.error("empty manifest"); process.exit(1); }
+                     console.log("manifest ok:", m.sports.map(s=>s.league).join(" "));'
