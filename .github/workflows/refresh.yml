@@ -1,0 +1,75 @@
+name: refresh feed
+
+# Deploys straight to Pages from an artifact rather than committing the JSON.
+# At a 5-minute cadence a commit-per-refresh would be ~288 commits a day and
+# would bury every real change in the history.
+on:
+  schedule:
+    # Every 5 minutes is the floor GitHub allows, and it is a best-effort floor:
+    # scheduled runs are routinely late under load. The feed is built to tolerate
+    # that -- see the staleness note in README.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:        # "Run workflow" in the Actions tab, for a manual refresh
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/fetch_feed.mjs'
+      - 'docs/index.html'
+      - '.github/workflows/refresh.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish; queue at most one behind it. Without this a slow
+# run and the next cron tick race each other onto Pages.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build the feed
+        run: node scripts/fetch_feed.mjs --out docs
+
+      - name: Check what was built
+        run: |
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("docs/manifest.json", "utf8"));
+            if (!m.sports.length) { console.error("empty manifest"); process.exit(1); }
+            for (const s of m.sports) {
+              const f = JSON.parse(fs.readFileSync("docs/" + s.file, "utf8"));
+              const games = new Set(f.picks.map(p => p.game_id)).size;
+              // A board whose games have all started is worse than no board:
+              // the ad would offer lines on a game in progress.
+              const live = f.picks.filter(p => Date.parse(p.start) <= Date.now()).length;
+              console.log(`${s.league}: ${games} matchups, ${f.picks.length} picks` +
+                          (live ? `, ${live} already started` : ""));
+              if (live === f.picks.length) {
+                console.error(`::error::${s.league} has no upcoming games`);
+                process.exit(1);
+              }
+            }
+            console.log(`expires ${m.expires_at}`);
+          '
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
