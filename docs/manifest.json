@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "fetched_at": "2026-11-14T16:55:29.047Z",
+  "expires_at": "2026-11-14T17:40:29.047Z",
+  "sports": [
+    {
+      "league": "CFB",
+      "label": "COLLEGE FOOTBALL",
+      "matchups": 6,
+      "picks": 74,
+      "file": "cfb.json"
+    },
+    {
+      "league": "TENNIS",
+      "label": "TENNIS",
+      "matchups": 2,
+      "picks": 6,
+      "file": "tennis.json"
+    }
+  ]
+}

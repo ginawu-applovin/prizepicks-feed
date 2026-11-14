@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PrizePicks feed</title>
+<style>
+  :root{--bg:#14141b;--surface:#1c1c25;--line:#31313e;--fg:#e9e9f1;--muted:#9191a6;--ok:#49d68a;--warn:#f2b53c;color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 ui-sans-serif,system-ui,sans-serif;padding:40px 20px 64px}
+  .wrap{max-width:760px;margin:0 auto}
+  h1{font-size:28px;margin:0;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:8px 0 0}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+  table{width:100%;border-collapse:collapse;margin-top:26px}
+  th{text-align:left;font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:500;padding:0 10px 10px 0;border-bottom:1px solid var(--line)}
+  td{padding:12px 10px 12px 0;border-bottom:1px solid var(--line);font-size:14px}
+  td a{color:#6f9dff}
+  .pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:600}
+  .fresh{background:#49d68a1f;color:var(--ok)}
+  .stale{background:#f2b53c1f;color:var(--warn)}
+  .meta{margin-top:26px;color:var(--muted);font-size:13px}
+  .err{background:#f2b53c14;border:1px solid #f2b53c55;border-radius:10px;padding:14px 16px;margin-top:24px;font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>PrizePicks feed</h1>
+  <p class="sub">Static props feed for the playable ads. Rebuilt every five minutes by GitHub Actions.</p>
+  <div id="out"></div>
+  <p class="meta">Base URL <code id="base"></code> &middot; <a href="https://github.com/ginawu-applovin/prizepicks-feed">repository</a></p>
+</div>
+<script>
+document.getElementById('base').textContent = location.origin + location.pathname.replace(/index\.html$/,'');
+fetch('manifest.json?t=' + Date.now()).then(r => r.json()).then(m => {
+  var age = (Date.now() - Date.parse(m.fetched_at)) / 60000;
+  var expired = Date.parse(m.expires_at) <= Date.now();
+  var rows = m.sports.map(function(s){
+    return '<tr><td><b>' + s.label + '</b></td><td>' + s.matchups + '</td><td>' + s.picks +
+           '</td><td><a class="mono" href="' + s.file + '">' + s.file + '</a></td></tr>';
+  }).join('');
+  document.getElementById('out').innerHTML =
+    '<p><span class="pill ' + (expired ? 'stale' : 'fresh') + '">' +
+    (expired ? 'expired' : 'fresh') + '</span> &nbsp;built ' + age.toFixed(0) +
+    ' min ago &middot; <span class="mono">' + m.fetched_at + '</span></p>' +
+    '<table><thead><tr><th>Sport</th><th>Matchups</th><th>Picks</th><th>File</th></tr></thead><tbody>' +
+    rows + '</tbody></table>';
+}).catch(function(e){
+  document.getElementById('out').innerHTML =
+    '<div class="err">Could not read <code>manifest.json</code>. If this is a fresh deploy the first Actions run may not have finished yet; check the Actions tab.</div>';
+});
+</script>
+</body>
+</html>
